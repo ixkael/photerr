@@ -1,6 +1,7 @@
 # flake8: noqa I252, F401
 from importlib import metadata
 
+from .custom import CustomErrorModel, CustomErrorParams
 from .euclid import EuclidWideErrorModel as EuclidErrorModel
 from .euclid import EuclidWideErrorParams as EuclidErrorParams
 from .euclid import *

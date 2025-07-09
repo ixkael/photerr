@@ -1,6 +1,6 @@
 """Custom photometric error model with per-object parameters."""
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any
 
 import numpy as np
@@ -119,8 +119,10 @@ class CustomErrorParams(ErrorParams):
     decorrelate: bool = True
     highSNR: bool = False
     errLoc: str = "after"
-    renameDict: dict[str, str] | None = None
     scale: dict[str, float] | float = field(default_factory=lambda: {})
+    
+    renameDict: InitVar[dict[str, str] | None] = None
+    validate: InitVar[bool] = True
 
 
 class CustomErrorModel(ErrorModel):
