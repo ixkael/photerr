@@ -1,13 +1,19 @@
-"""Custom photometric error model with per-object parameters."""
+"""Custom photometric error model with per-object parameters and error map support."""
 
 from dataclasses import InitVar, dataclass, field
-from typing import Any
+from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
 
 from photerr.model import ErrorModel
 from photerr.params import ErrorParams, param_docstring
+
+try:
+    import healpy as hp
+    HAS_HEALPY = True
+except ImportError:
+    HAS_HEALPY = False
 
 
 @dataclass
@@ -126,11 +132,14 @@ class CustomErrorParams(ErrorParams):
 
 
 class CustomErrorModel(ErrorModel):
-    """Custom photometric error model with per-object parameter support.
+    """Custom photometric error model with per-object parameter and error map support.
     
     This error model extends the base ErrorModel to accept per-object parameters
-    from the input DataFrame. This allows for more realistic error modeling where
-    observing conditions vary between objects.
+    from the input DataFrame or to work with pixelized error maps (HEALPix).
+    
+    Two modes of operation:
+    1. Per-object parameters: Traditional approach with parameters per object
+    2. Error maps: Sample objects from pixelized error maps
     
     Supported per-object parameters:
     - {band}_err: Direct magnitude error for each band
@@ -141,7 +150,7 @@ class CustomErrorModel(ErrorModel):
     - {band}_nvis: Number of visits for each band
     - {band}_scale: Error scaling factor for each band
     
-    Example usage:
+    Example usage (per-object parameters):
     
     ```python
     from photerr import CustomErrorModel
@@ -161,6 +170,36 @@ class CustomErrorModel(ErrorModel):
     err_model = CustomErrorModel()
     catalog_with_errors = err_model(catalog, random_state=42)
     ```
+    
+    Example usage (error maps):
+    
+    ```python
+    import healpy as hp
+    
+    # Create error maps (HEALPix format)
+    nside = 32
+    npix = hp.nside2npix(nside)
+    error_maps = {
+        'g': np.random.uniform(0.01, 0.1, npix),
+        'r': np.random.uniform(0.01, 0.08, npix)
+    }
+    
+    # Object density map (objects per pixel)
+    density_map = np.random.poisson(100, npix)
+    
+    # Create model from error maps
+    err_model = CustomErrorModel.from_error_maps(
+        error_maps=error_maps,
+        object_density_map=density_map,
+        nside=nside
+    )
+    
+    # Sample objects from maps
+    catalog = err_model.sample_objects_from_error_maps(
+        n_objects_total=10000,
+        random_state=42
+    )
+    ```
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -169,12 +208,203 @@ class CustomErrorModel(ErrorModel):
         Parameters are passed to the parent ErrorModel class.
         If no parameters are provided, CustomErrorParams defaults are used.
         """
+        # Initialize error map attributes
+        self._error_maps = None
+        self._object_density_map = None
+        self._nside = None
+        self._magnitude_distributions = None
+        
         if len(args) == 0 and len(kwargs) == 0:
             # Use default CustomErrorParams
             super().__init__(CustomErrorParams())
         else:
             # Pass arguments to parent class
             super().__init__(*args, **kwargs)
+    
+    @classmethod
+    def from_error_maps(
+        cls,
+        error_maps: Dict[str, np.ndarray],
+        object_density_map: np.ndarray,
+        nside: int,
+        magnitude_distributions: Optional[Dict[str, Dict[str, float]]] = None,
+        **kwargs: Any
+    ) -> 'CustomErrorModel':
+        """Create a CustomErrorModel from pixelized error maps.
+        
+        Parameters
+        ----------
+        error_maps : Dict[str, np.ndarray]
+            Dictionary mapping band names to HEALPix arrays of photometric errors.
+            Each array should have length hp.nside2npix(nside).
+        object_density_map : np.ndarray
+            HEALPix array of object density (objects per pixel).
+            Should have length hp.nside2npix(nside).
+        nside : int
+            HEALPix nside parameter.
+        magnitude_distributions : Dict[str, Dict[str, float]], optional
+            Parameters for sampling true magnitudes. Format:
+            {band: {'min': min_mag, 'max': max_mag, 'mean': mean_mag, 'std': std_mag}}
+            If not provided, uses reasonable defaults.
+        **kwargs
+            Additional parameters passed to CustomErrorModel constructor.
+            
+        Returns
+        -------
+        CustomErrorModel
+            Error model configured for error map sampling.
+        """
+        if not HAS_HEALPY:
+            raise ImportError("healpy is required for error map functionality")
+        
+        # Create instance
+        instance = cls(**kwargs)
+        
+        # Validate inputs
+        instance._validate_error_maps(error_maps, object_density_map, nside)
+        
+        # Store error map data
+        instance._error_maps = error_maps
+        instance._object_density_map = object_density_map
+        instance._nside = nside
+        instance._magnitude_distributions = magnitude_distributions or instance._default_magnitude_distributions()
+        
+        return instance
+    
+    def _validate_error_maps(
+        self,
+        error_maps: Dict[str, np.ndarray],
+        object_density_map: np.ndarray,
+        nside: int
+    ) -> None:
+        """Validate error maps and related inputs."""
+        if not isinstance(error_maps, dict):
+            raise TypeError("error_maps must be a dictionary")
+        
+        if len(error_maps) == 0:
+            raise ValueError("error_maps cannot be empty")
+        
+        expected_npix = hp.nside2npix(nside)
+        
+        # Check error maps
+        for band, error_map in error_maps.items():
+            if not isinstance(error_map, np.ndarray):
+                raise TypeError(f"error_maps[{band}] must be a numpy array")
+            if len(error_map) != expected_npix:
+                raise ValueError(f"error_maps[{band}] length {len(error_map)} != expected {expected_npix}")
+            if not np.all(np.isfinite(error_map)):
+                raise ValueError(f"error_maps[{band}] contains non-finite values")
+        
+        # Check object density map
+        if not isinstance(object_density_map, np.ndarray):
+            raise TypeError("object_density_map must be a numpy array")
+        if len(object_density_map) != expected_npix:
+            raise ValueError(f"object_density_map length {len(object_density_map)} != expected {expected_npix}")
+        if not np.all(object_density_map >= 0):
+            raise ValueError("object_density_map cannot contain negative values")
+    
+    def _default_magnitude_distributions(self) -> Dict[str, Dict[str, float]]:
+        """Get default magnitude distributions for sampling."""
+        return {
+            'g': {'min': 20.0, 'max': 26.0, 'mean': 23.0, 'std': 1.5},
+            'r': {'min': 19.0, 'max': 25.0, 'mean': 22.0, 'std': 1.5},
+            'i': {'min': 18.5, 'max': 24.5, 'mean': 21.5, 'std': 1.5},
+            'z': {'min': 18.0, 'max': 24.0, 'mean': 21.0, 'std': 1.5},
+        }
+    
+    def sample_objects_from_error_maps(
+        self,
+        n_objects_total: Optional[int] = None,
+        random_state: Optional[Union[int, np.random.Generator]] = None
+    ) -> pd.DataFrame:
+        """Sample objects from the error maps.
+        
+        Parameters
+        ----------
+        n_objects_total : int, optional
+            Total number of objects to sample. If not provided, uses the sum
+            of the object density map.
+        random_state : int or np.random.Generator, optional
+            Random state for reproducible sampling.
+            
+        Returns
+        -------
+        pd.DataFrame
+            Catalog of objects with positions, true magnitudes, and errors.
+        """
+        if self._error_maps is None:
+            raise ValueError("Error maps not set. Use from_error_maps() to create model.")
+        
+        rng = np.random.default_rng(random_state)
+        
+        # Determine number of objects to sample
+        if n_objects_total is None:
+            n_objects_total = int(np.sum(self._object_density_map))
+        
+        # Sample pixels based on object density
+        pixel_probs = self._object_density_map / np.sum(self._object_density_map)
+        pixels = rng.choice(len(pixel_probs), size=n_objects_total, p=pixel_probs)
+        
+        # Convert pixels to sky coordinates
+        theta, phi = hp.pix2ang(self._nside, pixels)
+        ra = phi * 180.0 / np.pi
+        dec = 90.0 - theta * 180.0 / np.pi
+        
+        # Sample true magnitudes
+        catalog_data = {
+            'ra': ra,
+            'dec': dec,
+            'pixel': pixels
+        }
+        
+        bands = list(self._error_maps.keys())
+        for band in bands:
+            # Sample magnitudes from distribution
+            mag_dist = self._magnitude_distributions.get(band, self._magnitude_distributions['g'])
+            
+            # Use truncated normal distribution
+            a = (mag_dist['min'] - mag_dist['mean']) / mag_dist['std']
+            b = (mag_dist['max'] - mag_dist['mean']) / mag_dist['std']
+            
+            # Sample from truncated normal
+            uniform_samples = rng.uniform(0, 1, n_objects_total)
+            from scipy.stats import truncnorm
+            true_mags = truncnorm.ppf(uniform_samples, a, b, 
+                                    loc=mag_dist['mean'], scale=mag_dist['std'])
+            
+            catalog_data[band] = true_mags
+            
+            # Add error from map
+            catalog_data[f'{band}_err'] = self._error_maps[band][pixels]
+        
+        # Create catalog
+        catalog = pd.DataFrame(catalog_data)
+        
+        # Apply error model using the direct errors
+        # Note: The error model will use the direct errors we provided
+        return self(catalog, random_state=random_state)
+    
+    def _interpolate_errors(self, pixels: np.ndarray) -> Dict[str, np.ndarray]:
+        """Interpolate errors for given pixels from error maps.
+        
+        Parameters
+        ----------
+        pixels : np.ndarray
+            Array of HEALPix pixel indices.
+            
+        Returns
+        -------
+        Dict[str, np.ndarray]
+            Dictionary mapping band names to interpolated errors.
+        """
+        if self._error_maps is None:
+            raise ValueError("Error maps not set")
+        
+        interpolated_errors = {}
+        for band, error_map in self._error_maps.items():
+            interpolated_errors[band] = error_map[pixels]
+        
+        return interpolated_errors
 
     def _get_per_object_params(self, catalog: pd.DataFrame, param_name: str, bands: list) -> dict:
         """Extract per-object parameters from catalog if available.
@@ -417,14 +647,30 @@ class CustomErrorModel(ErrorModel):
         else:
             magDf = catalog.copy()
             magDf[bands] = obsMags
+            
+            # Remove existing error columns to avoid duplicates
+            for band in bands:
+                err_col = f"{band}_err"
+                if err_col in magDf.columns:
+                    magDf = magDf.drop(columns=[err_col])
+            
             obsCatalog = pd.concat([magDf, errDf], axis=1)
 
         if self.params.errLoc == "after":
             # Reorder the columns so that the error columns come right after the
             # respective magnitude columns
-            columns = catalog.columns.tolist()
-            for band in bands:
-                columns.insert(columns.index(band) + 1, f"{band}_err")
+            columns = []
+            for col in catalog.columns:
+                if col not in [f"{band}_err" for band in bands]:  # Skip existing error columns
+                    columns.append(col)
+                    if col in bands:  # Add error column after magnitude column
+                        columns.append(f"{col}_err")
+            
+            # Add any remaining columns
+            for col in obsCatalog.columns:
+                if col not in columns:
+                    columns.append(col)
+            
             obsCatalog = obsCatalog[columns]
 
         return obsCatalog
